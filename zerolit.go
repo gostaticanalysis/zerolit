@@ -2,7 +2,9 @@ package zerolit
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/types"
+	"reflect"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
@@ -27,25 +29,55 @@ func run(pass *analysis.Pass) (any, error) {
 	nodeFilter := []ast.Node{
 		(*ast.ReturnStmt)(nil),
 		(*ast.AssignStmt)(nil),
-		(*ast.FuncType)(nil),
 	}
 
-	isNG := make(map[types.Object]bool)
+	isNonZero := make(map[types.Object]bool)
+	inspect.Preorder(nodeFilter, func(n ast.Node) {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			checkAssignStmt(pass, isNonZero, n)
+		}
+	})
+
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
 		switch n := n.(type) {
 		case *ast.ReturnStmt:
-			checkReturnStmt(pass, isNG, n)
-		case *ast.AssignStmt:
-			checkAssignStmt(pass, isNG, n)
-		case *ast.FuncType:
-			checkFuncType(pass, isNG, n)
+			checkReturnStmt(pass, isNonZero, n)
 		}
 	})
 
 	return nil, nil
 }
 
-func checkReturnStmt(pass *analysis.Pass, isNG map[types.Object]bool, ret *ast.ReturnStmt) {
+func checkAssignStmt(pass *analysis.Pass, isNonZero map[types.Object]bool, assign *ast.AssignStmt) {
+	if len(assign.Lhs) != len(assign.Rhs) {
+		return
+	}
+
+	for i := range assign.Lhs {
+		id, _ := assign.Lhs[i].(*ast.Ident)
+		obj := pass.TypesInfo.ObjectOf(id)
+		if obj != nil && !isZero(pass, obj.Type(), assign.Rhs[i]) {
+			isNonZero[obj] = true
+		}
+	}
+}
+
+func isZero(pass *analysis.Pass, typ types.Type, v ast.Expr) bool {
+	switch typ.Underlying().(type) {
+	case *types.Basic:
+		tv := pass.TypesInfo.Types[v]
+		return tv.Value != nil && reflect.ValueOf(constant.Val(tv.Value)).IsZero()
+	case *types.Pointer, *types.Slice, *types.Map, *types.Chan, *types.Signature, *types.Interface:
+		return types.Identical(pass.TypesInfo.TypeOf(v).Underlying(), types.Typ[types.UntypedNil])
+	case *types.Struct, *types.Array:
+		clit, _ := v.(*ast.CompositeLit)
+		return clit != nil && len(clit.Elts) == 0
+	}
+	return false
+}
+
+func checkReturnStmt(pass *analysis.Pass, isNonZero map[types.Object]bool, ret *ast.ReturnStmt) {
 	for _, v := range ret.Results {
 		id, _ := v.(*ast.Ident)
 		obj := pass.TypesInfo.ObjectOf(id)
@@ -54,57 +86,9 @@ func checkReturnStmt(pass *analysis.Pass, isNG map[types.Object]bool, ret *ast.R
 		}
 
 		for defID, def := range pass.TypesInfo.Defs {
-			if id != defID && def == obj {
-				if isNG[obj] {
-					pass.Reportf(v.Pos(), "zero value should return as a literal")
-				}
-				isNG[obj] = true
+			if id != defID && def == obj && !isNonZero[obj] {
+				pass.Reportf(v.Pos(), "zero value should return as a literal")
 				break
-			}
-		}
-	}
-}
-
-func checkAssignStmt(pass *analysis.Pass, isNG map[types.Object]bool, assign *ast.AssignStmt) {
-	for _, v := range assign.Lhs {
-		id, _ := v.(*ast.Ident)
-		obj := pass.TypesInfo.ObjectOf(id)
-		if obj == nil {
-			continue
-		}
-
-		for useID, use := range pass.TypesInfo.Uses {
-			if id != useID && use == obj {
-				if isNG[obj] {
-					pass.Reportf(useID.Pos(), "zero value should return as a literal")
-				}
-				isNG[obj] = true
-				break
-			}
-		}
-	}
-}
-
-func checkFuncType(pass *analysis.Pass, isNG map[types.Object]bool, funcType *ast.FuncType) {
-	if funcType.Results == nil {
-		return
-	}
-
-	for _, ret := range funcType.Results.List {
-		for _, id := range ret.Names {
-			obj := pass.TypesInfo.ObjectOf(id)
-			if obj == nil {
-				continue
-			}
-
-			for useID, use := range pass.TypesInfo.Uses {
-				if id != useID && use == obj {
-					if isNG[obj] {
-						pass.Reportf(useID.Pos(), "zero value should return as a literal")
-					}
-					isNG[obj] = true
-					break
-				}
 			}
 		}
 	}
